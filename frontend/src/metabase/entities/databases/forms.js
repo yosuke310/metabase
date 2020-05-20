@@ -46,7 +46,6 @@ const DATABASE_DETAIL_OVERRIDES = {
       { name: t`SSH Key`, value: "ssh-key" },
       { name: t`Password`, value: "password" },
     ],
-    //TODO: the default value of this select doesn't seem to work
   }),
 };
 
@@ -201,6 +200,7 @@ function getFieldsForEngine(engine, details) {
               : null
             : value,
         horizontal: field.type === "boolean",
+        initial: field.default,
         ...(overrides && overrides(engine, details)),
       });
     }
