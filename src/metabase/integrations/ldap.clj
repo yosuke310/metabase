@@ -134,7 +134,7 @@
   ([conn ^String dn]
     (when (ldap-group-base)
       (let [results (ldap/search conn (ldap-group-base) {:scope  :sub
-                                                         :filter (Filter/createEqualityFilter "member" dn)})]
+                                                         :filter (Filter/createEqualityFilter "memberUid" dn)})]
         (map :dn results)))))
 
 (def ^:private user-base-error  {:status :ERROR, :message "User search base does not exist or is unreadable"})
@@ -201,7 +201,7 @@
           :groups     (when (ldap-group-sync)
                         ;; Active Directory and others (like FreeIPA) will supply a `memberOf` overlay attribute for
                         ;; groups. Otherwise we have to make the inverse query to get them.
-                        (or (:memberof result) (get-user-groups dn) []))})))))
+                        (or (:memberof result) (get-user-groups username) []))})))))
 
 (defn verify-password
   "Verifies if the supplied password is valid for the `user-info` (from `find-user`) or DN."
