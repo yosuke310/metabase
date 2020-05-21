@@ -12,7 +12,11 @@
              [core :as mg]
              [credentials :as mcred]]
             [toucan.db :as db])
-  (:import [com.mongodb MongoClient MongoClientOptions MongoClientOptions$Builder MongoClientURI]))
+  (:import [com.mongodb MongoClient MongoClientOptions MongoClientOptions$Builder MongoClientURI]
+           java.io.ByteArrayInputStream
+           java.security.cert.CertificateFactory
+           java.security.KeyStore
+           [javax.net.ssl SSLContext TrustManagerFactory X509TrustManager]))
 
 (def ^:const ^:private connection-timeout-ms
   "Number of milliseconds to wait when attempting to establish a Mongo connection. By default, Monger uses a 10-second
@@ -55,20 +59,57 @@
     (MongoClientOptions$Builder. client-options)
     (MongoClientOptions$Builder.)))
 
+(defn socket-factory-for-cert
+  "Generates an SocketFactory with the custom certificate added"
+  [cert-string]
+  (let [cert-factory (CertificateFactory/getInstance "X.509")
+        cert-stream (ByteArrayInputStream. (.getBytes ^String cert-string "UTF-8"))
+        certs (.generateCertificates cert-factory cert-stream)
+        keystore (doto (KeyStore/getInstance (KeyStore/getDefaultType))
+                   (.load nil nil))
+        ;; this TrustManagerFactory is used for cloning the default certs into the new TrustManagerFactory
+        base-trust-manager-factory (doto (TrustManagerFactory/getInstance (TrustManagerFactory/getDefaultAlgorithm))
+                                     (.init (cast KeyStore nil)))
+
+        ;; this is the final TrustManagerFactory used to initialize the SSLContext
+        trust-manager-factory (TrustManagerFactory/getInstance (TrustManagerFactory/getDefaultAlgorithm))
+
+        ssl-context (SSLContext/getInstance "TLS")
+
+        dn-for-cert (fn [cert] (-> cert
+                                   (.getSubjectX500Principal)
+                                   (.getName)))]
+    (doseq [cert certs]
+      (.setCertificateEntry keystore (dn-for-cert cert) cert))
+
+    (doseq [trust-mgr (.getTrustManagers base-trust-manager-factory)]
+      (when (instance? X509TrustManager trust-mgr)
+        (doseq [issuer (.getAcceptedIssuers trust-mgr)]
+          (.setCertificateEntry keystore (dn-for-cert issuer) issuer))))
+
+    (.init trust-manager-factory keystore)
+    (.init ssl-context nil (.getTrustManagers trust-manager-factory) nil)
+
+    (.getSocketFactory ssl-context)))
+
 (defn- connection-options-builder
   "Build connection options for Mongo.
   We have to use `MongoClientOptions.Builder` directly to configure our Mongo connection since Monger's wrapper method
   doesn't support `.serverSelectionTimeout` or `.sslEnabled`. `additional-options`, a String like
   `readPreference=nearest`, can be specified as well; when passed, these are parsed into a `MongoClientOptions` that
   serves as a starting point for the changes made below."
-  ^MongoClientOptions [& {:keys [ssl? additional-options]
-                          :or   {ssl? false}}]
-  (-> (client-options-for-url-params additional-options)
-      client-options->builder
-      (.description config/mb-app-id-string)
-      (.connectTimeout connection-timeout-ms)
-      (.serverSelectionTimeout connection-timeout-ms)
-      (.sslEnabled ssl?)))
+  ^MongoClientOptions [& {:keys [ssl? additional-options ssl-cert]
+                          :or   {ssl? false, ssl-cert ""}, :as details}]
+  (let [client-options (-> (client-options-for-url-params additional-options)
+                           client-options->builder
+                           (.description config/mb-app-id-string)
+                           (.connectTimeout connection-timeout-ms)
+                           (.serverSelectionTimeout connection-timeout-ms)
+                           (.sslEnabled ssl?))]
+    (if ssl-cert
+      (-> client-options
+          (.socketFactory (socket-factory-for-cert ssl-cert)))
+      client-options)))
 
 ;; The arglists metadata for mg/connect are actually *WRONG* -- the function additionally supports a 3-arg airity
 ;; where you can pass options and credentials, as we'd like to do. We need to go in and alter the metadata of this
@@ -97,8 +138,8 @@
   (format "mongodb+srv://%s:%s@%s/%s" user pass host authdb))
 
 (defn- normalize-details [details]
-  (let [{:keys [dbname host port user pass ssl authdb tunnel-host tunnel-user tunnel-pass additional-options use-srv]
-         :or   {port 27017, pass "", ssl false, use-srv false}} details
+  (let [{:keys [dbname host port user pass ssl authdb tunnel-host tunnel-user tunnel-pass additional-options use-srv ssl-cert]
+         :or   {port 27017, pass "", ssl false, use-srv false, ssl-cert ""}} details
         ;; ignore empty :user and :pass strings
         user             (when (seq user)
                            user)
@@ -115,7 +156,8 @@
      :dbname             dbname
      :ssl                ssl
      :additional-options additional-options
-     :srv?               use-srv}))
+     :srv?               use-srv
+     :ssl-cert           ssl-cert}))
 
 (defn- fqdn?
   "A very simple way to check if a hostname is fully-qualified:
@@ -129,11 +171,11 @@
    replica list could easily provided instead of a single host.
    Using SRV automatically enables SSL, though we explicitly set SSL to true anyway.
    Docs to generate URI string: https://docs.mongodb.com/manual/reference/connection-string/#dns-seedlist-connection-format"
-  [{:keys [host port user authdb pass dbname ssl additional-options]}]
+  [{:keys [host port user authdb pass dbname ssl additional-options ssl-cert], :as details}]
   (if-not (fqdn? host)
     (throw (ex-info (tru "Using DNS SRV requires a FQDN for host")
                     {:host host}))
-    (let [conn-opts (connection-options-builder :ssl? ssl, :additional-options additional-options)
+    (let [conn-opts (connection-options-builder :ssl? ssl, :additional-options additional-options, :ssl-cert ssl-cert)
           authdb (if (seq authdb)
                    authdb
                    dbname)
@@ -145,11 +187,12 @@
   "Connection info for Mongo.  Returns options for the fallback method to connect
    to hostnames that are not FQDNs.  This works with 'localhost', but has been problematic with FQDNs.
    If you would like to provide a FQDN, use `srv-connection-info`"
-  [{:keys [host port user authdb pass dbname ssl additional-options]}]
+  [{:keys [host port user authdb pass dbname ssl additional-options ssl-cert], :as details}]
   (let [server-address                   (mg/server-address host port)
         credentials                      (when user
                                            (mcred/create user authdb pass))
-        ^MongoClientOptions$Builder opts (connection-options-builder :ssl? ssl, :additional-options additional-options)]
+        ^MongoClientOptions$Builder opts (connection-options-builder :ssl? ssl, :additional-options additional-options,
+                                                                     :ssl-cert ssl-cert)]
     {:type           :normal
      :server-address server-address
      :credentials    credentials

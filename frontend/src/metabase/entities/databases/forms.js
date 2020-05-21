@@ -45,6 +45,11 @@ const DATABASE_DETAIL_OVERRIDES = {
       return null;
     },
   }),
+  "ssl-cert": (engine, details) => ({
+    title: t`Server SSL certificate chain`,
+    placeholder: t`Paste the contents of the server's SSL certificate chain here`,
+    type: "text",
+  }),
 };
 
 const AUTH_URL_PREFIXES = {
